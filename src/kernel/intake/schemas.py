@@ -27,9 +27,14 @@ class CanonicalBooking:
     quantity: int
     starts_at: datetime
     ends_at: datetime
-    unit_amount_cents: int
+    amount_cents: int
     currency: str
     updated_at: Instant
+    #: What ``amount_cents`` counts. Shape can be normalised; meaning cannot.
+    #: ``per_unit`` multiplies by quantity, ``per_booking`` does not, and no
+    #: payload on earth says which one it is. Every adapter declares the one it
+    #: was told, and the declaration is a question until somebody confirms it.
+    amount_basis: str = "per_unit"
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,8 @@ def canonical_fingerprint(booking: CanonicalBooking) -> str:
             "quantity": booking.quantity,
             "starts_at": booking.starts_at.isoformat(),
             "ends_at": booking.ends_at.isoformat(),
-            "unit_amount_cents": booking.unit_amount_cents,
+            "amount_cents": booking.amount_cents,
+            "amount_basis": booking.amount_basis,
             "currency": booking.currency,
         },
         sort_keys=True,

@@ -73,3 +73,13 @@ round.
 4. **Confirmation that `price_cents` is per unit.** Same trap as everywhere
    else: the file parses either way and the invoice is wrong by the number of
    units.
+
+## The assumption in the money field
+
+`price_cents` was described to us as **the total for the row**, already
+multiplied by `units`. That is a declaration, not something the payload says,
+and it is deliberately the opposite of what the other feed was told.
+
+**The question that would change the behaviour:** does `price_cents` already
+include `units`, or is it the price of one? Read it the wrong way and every
+invoice from this feed is wrong by the quantity, and every row still parses.

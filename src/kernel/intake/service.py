@@ -31,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from .. import journal
+from .. import journal, mutations
 from ..clock import Instant, Order, compare, utc_now
 from ..models import (
     BatchState,
@@ -41,6 +41,7 @@ from ..models import (
     ImportBatch,
     ProcessedEvent,
     QuarantineItem,
+    VersionConflict,
 )
 from .schemas import CanonicalBooking, Rejection, canonical_fingerprint
 
@@ -185,6 +186,8 @@ def apply_delivery(
                 "naive local time is two instants, and nothing in the payload says which."
             ),
         )
+        stored.undecided_reason = "order_not_provable"
+        session.flush()
         return _finish(
             session, delivery, DeliveryOutcome.ORDER_NOT_PROVABLE,
             reason="order against the held state cannot be proved",
@@ -201,6 +204,37 @@ def apply_delivery(
                 reason="same timestamp, same content",
                 subject=subject, refused=False,
             )
+        if mutations.is_disabled(mutations.CONFLICT_IS_NOT_A_DUPLICATE):
+            # The mutation: treat it as the latest arrival and move on. Nobody
+            # is told, and one of the two versions is gone.
+            for field, value in _booking_values(normalised, delivery.id).items():
+                if field in ("partner", "external_id", "first_seen_at"):
+                    continue
+                setattr(stored, field, value)
+            session.flush()
+            return _finish(
+                session, delivery, DeliveryOutcome.APPLIED,
+                reason=None, subject=subject, refused=False,
+            )
+
+        question = (
+            "These two records have the same booking ID and updatedAt but different "
+            "statuses. Can updatedAt identify a revision, or is there a separate "
+            "sequence? The affected booking remains on billing hold until this is "
+            "resolved."
+        )
+        session.add(
+            VersionConflict(
+                booking_id=stored.id,
+                delivery_id=delivery.id,
+                held_fingerprint=stored.payload_fingerprint,
+                incoming_fingerprint=fingerprint,
+                held_payload={"status": stored.status, "quantity": stored.quantity,
+                              "updated_at": stored.updated_at_raw},
+                incoming_payload=raw,
+                question_for_partner=question,
+            )
+        )
         _raise_quarantine(
             session, normalised.partner, normalised.external_id, delivery.id,
             kind="conflicting_versions",
@@ -208,15 +242,15 @@ def apply_delivery(
                 f"two different versions of this booking carry the same timestamp "
                 f"{normalised.updated_at.raw!r}"
             ),
-            needed_from_partner=(
-                "Two payloads, one timestamp, different content. Which one is current? "
-                "The kernel holds both and changes nothing: last write wins would be a "
-                "coin toss with the customer's booking."
-            ),
+            needed_from_partner=question,
         )
+        # Both versions are kept and neither is applied. Until somebody answers,
+        # nothing about this booking is decidable, so nothing about it is billed.
+        stored.undecided_reason = "conflicting_versions"
+        session.flush()
         return _finish(
             session, delivery, DeliveryOutcome.CONFLICT,
-            reason="same timestamp, different content",
+            reason="same identity, same version, different content",
             subject=subject, refused=True,
             detail={"held_fingerprint": stored.payload_fingerprint, "delivered_fingerprint": fingerprint},
         )
@@ -394,7 +428,8 @@ def _booking_values(booking: CanonicalBooking, delivery_id: int) -> dict:
         "quantity": booking.quantity,
         "starts_at": booking.starts_at,
         "ends_at": booking.ends_at,
-        "unit_amount_cents": booking.unit_amount_cents,
+        "amount_cents": booking.amount_cents,
+        "amount_basis": booking.amount_basis,
         "currency": booking.currency,
         "updated_at_raw": booking.updated_at.raw,
         "updated_at_lo": booking.updated_at.lo,
@@ -454,6 +489,21 @@ def _quarantine(
         kind=rejection.kind, detail=rejection.detail,
         needed_from_partner=rejection.needed_from_partner,
     )
+    # If this message was about a booking already held, that booking has just
+    # become undecidable: something was said about it that nobody can read. It
+    # stops being prepared for billing until the question is answered. That is
+    # a conservative choice, and a deliberate one.
+    if rejection.external_id and not mutations.is_disabled(mutations.UNDECIDED_BLOCKS_BILLING):
+        known = session.scalar(
+            select(Booking).where(
+                Booking.partner == rejection.partner,
+                Booking.external_id == rejection.external_id,
+            )
+        )
+        if known is not None:
+            known.undecided_reason = rejection.kind
+            delivery.booking_id = known.id
+            session.flush()
     journal.refused(
         session, "intake.apply",
         f"{rejection.partner}/{rejection.external_id or 'unknown'}",
@@ -513,3 +563,56 @@ def _drive_entitlement(session: Session, booking_id: int) -> None:
     from ..entitlements.service import reconcile_entitlement
 
     reconcile_entitlement(session, booking_id)
+
+
+
+def resolve_and_replay(
+    session: Session,
+    adapter: "PartnerAdapter",
+    partner: str,
+    external_id: str,
+    answer: str,
+    replay: dict | None = None,
+) -> IntakeResult | None:
+    """Close an open question, then look at the held message again.
+
+    This is the other half of holding something back, and the half that is
+    usually missing. A quarantine that can only be emptied by hand is a
+    quarantine that fills up until somebody turns the check off.
+
+    ``answer`` is what the partner said, kept next to the question. ``replay``
+    is the corrected payload if they resent one; without it the booking simply
+    becomes decidable again and the next run bills it.
+    """
+    booking = session.scalar(
+        select(Booking).where(Booking.partner == partner, Booking.external_id == external_id)
+    )
+    open_items = session.scalars(
+        select(QuarantineItem).where(
+            QuarantineItem.partner == partner,
+            QuarantineItem.external_id == external_id,
+            QuarantineItem.resolved_at.is_(None),
+        )
+    ).all()
+    for item in open_items:
+        item.resolved_at = utc_now()
+        item.detail = f"{item.detail}\nanswered: {answer}"
+
+    for conflict in session.scalars(
+        select(VersionConflict)
+        .where(VersionConflict.resolved_at.is_(None))
+        .where(VersionConflict.booking_id == (booking.id if booking else -1))
+    ).all():
+        conflict.resolved_at = utc_now()
+
+    if booking is not None:
+        booking.undecided_reason = None
+    journal.accepted(
+        session, "intake.resolve", f"{partner}/{external_id}",
+        f"question answered: {answer}",
+    )
+    session.flush()
+
+    if replay is None:
+        return None
+    return apply_delivery(session, adapter, replay, channel="replay")

@@ -23,6 +23,14 @@ from ..models import BookingStatus
 
 LINDHOFF = "lindhoff"
 
+#: Declared, not observed, and deliberately different from the other feed.
+#: Lindhoff's ``price_cents`` was described to us as the total for the row,
+#: already multiplied by ``units``. Read it the other way and every invoice
+#: from this feed is wrong by the quantity, and every payload still parses.
+#: The question that would change this: "does price_cents already include
+#: units, or is it the price of one?"
+AMOUNT_BASIS = "per_booking"
+
 _STATUS = {
     "OK": BookingStatus.CONFIRMED.value,
     "CHG": BookingStatus.AMENDED.value,
@@ -136,7 +144,8 @@ class LindhoffAdapter:
             quantity=quantity,
             starts_at=starts_at,
             ends_at=ends_at,
-            unit_amount_cents=amount,
+            amount_cents=amount,
+            amount_basis=AMOUNT_BASIS,
             currency=str(raw["curr"]).upper(),
             updated_at=updated_at,
         )

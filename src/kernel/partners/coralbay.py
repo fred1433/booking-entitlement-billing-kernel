@@ -27,6 +27,13 @@ from ..models import BookingStatus
 
 CORALBAY = "coralbay"
 
+#: Declared, not observed. Coralbay's ``amount_minor`` was described to us as
+#: the price of one unit, so a booking for two costs twice it.
+#: The question that would change this: "is amount_minor the price per pax, or
+#: the total for the booking?" Nothing in the payload answers it, and the two
+#: readings differ by the quantity on every invoice.
+AMOUNT_BASIS = "per_unit"
+
 _STATUS = {
     "confirmed": BookingStatus.CONFIRMED.value,
     "amended": BookingStatus.AMENDED.value,
@@ -142,7 +149,8 @@ class CoralbayAdapter:
             quantity=quantity,
             starts_at=starts_at,
             ends_at=ends_at,
-            unit_amount_cents=amount,
+            amount_cents=amount,
+            amount_basis=AMOUNT_BASIS,
             currency=str(raw["currency"]).upper(),
             updated_at=updated_at,
         )

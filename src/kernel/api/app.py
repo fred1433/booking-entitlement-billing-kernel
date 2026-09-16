@@ -1,118 +1,67 @@
-"""The HTTP surface, deliberately thin.
+"""A deliberately small HTTP surface.
 
-One decision worth writing down, because it is the one that gets an integration
-stuck in a retry storm on day three:
+Two routes. This sample is not a service to deploy, and a larger API would be
+more code without another failure path. What is here exists because the intake
+rules have to be reachable the way a partner would reach them, and because the
+status code a partner receives is itself a decision:
 
-* a delivery the kernel has already seen answers 200 with ``duplicate``. It is
-  the truth, and any other answer puts a non problem back into the partner's
-  retry queue;
-* a delivery the kernel could not use answers 202 with ``quarantined``. We have
-  it, we are not acting on it, and redelivering the same bytes will not change
-  that. It is our question to ask, not their message to resend;
-* only a genuine failure on our side answers 5xx, because 5xx is the one answer
-  that means "send it again".
+* **200** for a delivery that was applied, and for one that was recognised as a
+  repeat. A partner retrying must be told "I have this", not "try again", or a
+  correct retry policy on their side turns into a storm on ours.
+* **202** for a delivery that was accepted and held. It was recorded, it was
+  not applied, and a question is open. Answering 400 would invite them to
+  discard it, and the message is not malformed, it is unreadable in a way only
+  they can settle.
+* **409** for the one case where the partner really must look: two versions of
+  one booking carrying the same identity and the same version.
+
+Nothing here is deployed anywhere.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from fastapi import Body, FastAPI, HTTPException, Response
+from sqlalchemy.orm import sessionmaker
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
-from pydantic import BaseModel
-from sqlalchemy.orm import Session, sessionmaker
-
-from ..config import Settings
-from ..db import make_engine, make_session_factory
-from ..entitlements.claim import ClaimRefused, consume_claim_token
-from ..intake.service import apply_delivery
-from ..models import DeliveryOutcome
 from ..billing.reconciliation import reconcile, render_reconciliation
-from ..partners import CORALBAY, LINDHOFF, CoralbayAdapter, LindhoffAdapter
+from ..db import make_engine, make_session_factory
+from ..intake import apply_delivery
+from ..models import DeliveryOutcome
+from ..partners import ADAPTERS
 
-ADAPTERS = {
-    CORALBAY: CoralbayAdapter(),
-    LINDHOFF: LindhoffAdapter(),
+_HELD = {
+    DeliveryOutcome.QUARANTINED,
+    DeliveryOutcome.ORDER_NOT_PROVABLE,
+    DeliveryOutcome.HELD,
 }
 
-ACCEPTED_OUTCOMES = {
-    DeliveryOutcome.APPLIED,
-    DeliveryOutcome.DUPLICATE,
-    DeliveryOutcome.SUPERSEDED,
-}
 
-
-class ClaimRequest(BaseModel):
-    claimed_by: str
-
-
-def create_app(session_factory: sessionmaker[Session] | None = None,
-               settings: Settings | None = None) -> FastAPI:
-    settings = settings or Settings.from_env()
-    factory = session_factory or make_session_factory(make_engine(settings.database_url))
-    app = FastAPI(title="booking to billing integration kernel", version="0.1.0")
-
-    def get_session() -> Any:
-        session = factory()
-        try:
-            yield session
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
-    @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+def create_app(session_factory: sessionmaker | None = None) -> FastAPI:
+    sessions = session_factory or make_session_factory(make_engine())
+    app = FastAPI(title="booking to billing failure cases", docs_url=None, redoc_url=None)
 
     @app.post("/partners/{partner}/deliveries")
-    def receive(partner: str, payload: dict, response: Response,
-                session: Session = Depends(get_session)) -> dict[str, Any]:
+    def receive(partner: str, response: Response, payload: dict = Body(...)) -> dict:
         adapter = ADAPTERS.get(partner)
         if adapter is None:
-            raise HTTPException(status_code=404, detail=f"unknown partner {partner}")
+            raise HTTPException(status_code=404, detail=f"unknown partner {partner!r}")
 
-        result = apply_delivery(session, adapter, payload, channel="push")
-        if result.outcome not in ACCEPTED_OUTCOMES:
-            response.status_code = status.HTTP_202_ACCEPTED
-        return {
-            "outcome": result.outcome.value,
-            "delivery_id": result.delivery_id,
-            "booking_id": result.booking_id,
-            "reason": result.reason,
-        }
+        with sessions() as session:
+            result = apply_delivery(session, adapter, payload, channel="push")
+            session.commit()
+            outcome, delivery_id, reason = result.outcome, result.delivery_id, result.reason
 
-    @app.post("/claims/{token}")
-    def claim(token: str, body: ClaimRequest,
-              session: Session = Depends(get_session)) -> dict[str, Any]:
-        try:
-            entitlement = consume_claim_token(session, token, body.claimed_by, settings)
-        except ClaimRefused as error:
-            raise HTTPException(status_code=410, detail=error.reason) from error
-        return {"entitlement_id": entitlement.id, "state": entitlement.state}
+        if outcome is DeliveryOutcome.CONFLICT:
+            response.status_code = 409
+        elif outcome in _HELD:
+            response.status_code = 202
+        return {"outcome": outcome.value, "delivery_id": delivery_id, "detail": reason}
 
     @app.get("/reports/reconciliation/{period}")
-    def reconciliation(period: str, session: Session = Depends(get_session)) -> dict[str, Any]:
-        report = reconcile(session, period)
-        return {
-            "period": report.period,
-            "generated_at": report.generated_at,
-            "lines": [
-                {"state": row.state, "count": row.count, "amount_cents": row.amount_cents}
-                for row in report.by_state
-            ],
-            "waiting_on_partners": [
-                {
-                    "partner": item.partner,
-                    "external_id": item.external_id,
-                    "kind": item.kind,
-                    "needed_from_partner": item.needed_from_partner,
-                    "days_open": item.days_open,
-                }
-                for item in report.waiting_on_partners
-            ],
-            "text": render_reconciliation(report),
-        }
+    def reconciliation(period: str) -> Response:
+        with sessions() as session:
+            report = reconcile(session, period)
+            body = render_reconciliation(session, report)
+        return Response(content=body, media_type="text/plain")
 
     return app

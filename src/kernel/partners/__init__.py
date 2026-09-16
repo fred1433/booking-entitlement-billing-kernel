@@ -11,7 +11,16 @@ from .base import PartnerAdapter
 from .coralbay import CORALBAY, CoralbayAdapter
 from .lindhoff import LINDHOFF, LindhoffAdapter
 
+#: The two sources, by name. They are not two integrations: they are two
+#: incompatible representations crossing the same boundary, which is the only
+#: reason there are two.
+ADAPTERS: dict[str, PartnerAdapter] = {
+    CORALBAY: CoralbayAdapter(),
+    LINDHOFF: LindhoffAdapter(),
+}
+
 __all__ = [
+    "ADAPTERS",
     "PartnerAdapter",
     "CORALBAY",
     "CoralbayAdapter",

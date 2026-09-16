@@ -1,13 +1,11 @@
-"""booking-to-billing integration kernel.
+"""Booking-to-billing failure cases.
 
-A small, readable core for the part of a booking integration that is not the
-domain: duplicate deliveries, out-of-order updates, partner data that disagrees
-with itself, and a billing run that must never charge twice.
+A short memo whose evidence is code. Every case in the README is a test that
+fails without its control and passes with it.
 
-Both partner adapters in this repository are fictional. They are written to
-disagree with each other on purpose.
+Both partner adapters in this repository are fictional, and the payment
+provider is a simulation with its own table. Nothing here makes a network call,
+and nothing here has ever held a payment key. What is assumed, what was decided
+for the demonstration, and what only a partner could confirm are listed in
+docs/what-needs-confirmation.md.
 """
-
-__all__ = ["__version__"]
-
-__version__ = "0.1.0"

@@ -1,79 +1,65 @@
-one night of partner traffic, through the kernel
-both partners are fictional
+one run of synthetic partner traffic
+both partners are fictional, and the payment provider is a simulation
 
-  Coralbay pushes three bookings, and retries one of them twice
-
-  an old copy of an update arrives after the new one
-
-  Lindhoff drops its nightly file: one good row, one unknown status, two readings inside the hour the clocks go back
-
-  every holder claims their entitlement, each link spent once
-
-  the monthly run starts, the worker dies after the second charge, and the third charge is taken but its answer never comes back
-
-  the run is started again, and the charge whose answer was lost is presented under the same key rather than taken a second time
-
-  one booking is cancelled after its charge was taken
+  Coralbay pushes two bookings, and retries the first one twice
+  an older copy of an update arrives after the newer one
+  two versions of one booking arrive carrying the same timestamp
+  Lindhoff drops its nightly file, and one row carries a status nobody declared
+  the monthly run prepares what it is allowed to prepare
+  the worker submits, and the answer to one operation never comes back
+  the worker restarts and resumes: the same key, the same parameters
+  one booking is cancelled, after its operation was already established
 
 
 journal
 
-  accepted  intake.apply             coralbay/CB-1000          first delivery for this booking
-  accepted  entitlement.create       entitlement/1
-  accepted  entitlement.transition   entitlement/1             booking confirmed by the partner
-  accepted  intake.apply             coralbay/CB-1001          first delivery for this booking
-  accepted  entitlement.create       entitlement/2
-  accepted  entitlement.transition   entitlement/2             booking confirmed by the partner
-  accepted  intake.apply             coralbay/CB-1002          first delivery for this booking
-  accepted  entitlement.create       entitlement/3
-  accepted  entitlement.transition   entitlement/3             booking confirmed by the partner
-  accepted  intake.apply             coralbay/CB-1000          event id already processed
-  accepted  intake.apply             coralbay/CB-1000          event id already processed
-  accepted  intake.apply             coralbay/CB-1002
-  refused   intake.apply             coralbay/CB-1002          older than the state we hold, applying it would move the booking backwards
-  accepted  intake.apply             lindhoff/LH-2000          first delivery for this booking
-  accepted  entitlement.create       entitlement/4
-  accepted  entitlement.transition   entitlement/4             booking confirmed by the partner
-  refused   intake.apply             lindhoff/LH-2001          unknown_status_value: status='HOLD' is not one of OK, CHG, VOID
-  accepted  intake.apply             lindhoff/LH-2002          first delivery for this booking
-  accepted  entitlement.create       entitlement/5
-  accepted  entitlement.transition   entitlement/5             booking confirmed by the partner
-  accepted  intake.file              lindhoff/lindhoff-2026-08-04.csv
-  refused   intake.apply             lindhoff/LH-2002          order against the held state cannot be proved
-  accepted  claim.issue              entitlement/1
-  accepted  entitlement.transition   entitlement/1             claimed by holder-1
-  accepted  claim.issue              entitlement/2
-  accepted  entitlement.transition   entitlement/2             claimed by holder-2
-  accepted  claim.issue              entitlement/3
-  accepted  entitlement.transition   entitlement/3             claimed by holder-3
-  accepted  claim.issue              entitlement/4
-  accepted  entitlement.transition   entitlement/4             claimed by holder-4
-  accepted  claim.issue              entitlement/5
-  accepted  entitlement.transition   entitlement/5             claimed by holder-5
-  refused   billing.prepare          entitlement/5             source data is in quarantine: order_not_provable
-  accepted  billing.prepare          period/2026-08
-  accepted  billing.charge           line/1
-  refused   billing.charge           line/2                    provider did not answer: the charge for bill:2:2026-08 was created and the response was lost
-  accepted  billing.charge           line/3
-  accepted  billing.charge           line/2                    provider replayed the charge it had already taken for this key
-  accepted  billing.charge           line/4
-  accepted  intake.apply             coralbay/CB-1001
-  accepted  entitlement.transition   entitlement/2             the partner cancelled the booking
-  refused   billing.cancel           line/2                    cancelled after the charge, a refund is owed and is not automatic
+  accepted  intake.apply             coralbay/CB-1000           first delivery for this booking
+  accepted  entitlement.create       entitlement/1           
+  accepted  intake.apply             coralbay/CB-1001           first delivery for this booking
+  accepted  entitlement.create       entitlement/2           
+  accepted  intake.apply             coralbay/CB-1000           event id already processed
+  accepted  intake.apply             coralbay/CB-1000           event id already processed
+  accepted  intake.apply             coralbay/CB-1001        
+  refused   intake.apply             coralbay/CB-1001           older than the state we hold, applying it would move the booking backwards
+  accepted  intake.apply             coralbay/CB-1002           first delivery for this booking
+  accepted  entitlement.create       entitlement/3           
+  refused   intake.apply             coralbay/CB-1002           same identity, same version, different content
+  accepted  intake.apply             lindhoff/LH-2000           first delivery for this booking
+  accepted  entitlement.create       entitlement/4           
+  accepted  intake.file              lindhoff/2026-08-04.csv 
+  refused   intake.apply             lindhoff/LH-2000           unknown_status_value: status='HOLD' is not one of OK, CHG, VOID
+  accepted  billing.prepare          entitlement/1           
+  accepted  billing.prepare          entitlement/2           
+  refused   billing.prepare          entitlement/3              not prepared while a question is open: conflicting_versions
+  refused   billing.prepare          entitlement/4              not prepared while a question is open: unknown_status_value
+  refused   billing.submit           line/1                     the operation for bill:1:2026-08 was carried out and the response was lost
+  accepted  billing.submit           line/2                  
+  accepted  billing.resume           line/1                     the provider replayed the operation it had already carried out
+  refused   billing.cancel           line/1                     cancelled after the operation was established: what is owed is a commercial decision, and this sample does not make it
 
-  42 entries, 6 of them refusals
-  payment provider: 5 calls, 4 charges
+  23 entries, 7 of them refusals
+  simulated provider: 3 calls, 2 operations actually carried out
 
 
-reconciliation  period=2026-08  generated=2026-09-16T13:22:58+00:00
+reconciliation  period=2026-08  generated=2026-09-16T14:06:54+00:00
 
 billing lines
-  blocked         1       EUR 150.00
-  charged         3      EUR 1180.00
-  refund_due      1       EUR 480.00
+  blocked        2       660.00   not prepared, a question about the source data is open
+  charged        2     1,520.00   outcome established with the external system
 
-waiting on partners
-  lindhoff/LH-2001             unknown_status_value         open 0 day(s)
-      needed: What does status='HOLD' mean? It is not in the three values we agreed. The rows carrying it are held until you tell us, rather than mapped to the nearest thing.
-  lindhoff/LH-2002             order_not_provable           open 0 day(s)
-      needed: Send changed_at in UTC or with an explicit offset. One hour a year, a naive local time is two instants, and nothing in the payload says which.
+cancellations, by where they landed
+  after_charge           1
+
+waiting on partners   (synthetic examples, nothing was sent to anybody)
+  coralbay/CB-1002   conflicting_versions   open 0 day(s)
+      needed:      These two records have the same booking ID and updatedAt but different statuses. Can updatedAt identify a revision, or is there a separate sequence? The affected booking remains on billing hold until this is resolved.
+      holding up:  billing preparation for this booking
+      counterpart: the partner's integration contact
+      next action: ask, then replay the held message
+      status:      Not requested, synthetic example
+  lindhoff/LH-2000   unknown_status_value   open 0 day(s)
+      needed:      What does status='HOLD' mean? It is not in the three values we agreed. The rows carrying it are held until you tell us, rather than mapped to the nearest thing.
+      holding up:  billing preparation for this booking
+      counterpart: the partner's integration contact
+      next action: ask, then replay the held message
+      status:      Not requested, synthetic example

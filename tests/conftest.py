@@ -1,8 +1,11 @@
-"""Test fixtures.
+"""Fixtures.
 
-The tests run against a real PostgreSQL, on the schema the migration produced,
-because half of what this kernel promises is kept by unique indexes and a
-sqlite substitute would quietly stop testing exactly the half that matters.
+The suite runs against a real PostgreSQL, on the schema the migration
+produced, because several of the things being demonstrated are kept by unique
+indexes and by row locks. A substitute database would quietly stop testing
+exactly the half that matters.
+
+Both partners are fictional and all data here is synthetic.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from kernel.config import Settings
+from kernel.billing.payments import SimulatedProvider
 from kernel.db import make_engine, make_session_factory
 from kernel.models import Base
 from kernel.partners import CoralbayAdapter, LindhoffAdapter
@@ -75,7 +78,7 @@ def session(session_factory) -> Session:
 
 @pytest.fixture
 def other_session(session_factory) -> Session:
-    """A second connection, for the races that only a second connection shows."""
+    """A second connection, for the races only a second connection shows."""
     session = session_factory()
     try:
         yield session
@@ -85,20 +88,25 @@ def other_session(session_factory) -> Session:
 
 
 @pytest.fixture
-def settings() -> Settings:
-    """Test settings. The secret is a test value and only ever a test value."""
-    return Settings(
-        database_url=_database_url(),
-        claim_token_secret="test-secret-not-used-anywhere-else",
-        claim_token_ttl_seconds=3600,
-        share_limit=3,
-    )
+def provider(session_factory) -> SimulatedProvider:
+    """The stand-in external system, with its own durable store."""
+    return SimulatedProvider(session_factory)
+
+
+@pytest.fixture
+def coralbay() -> CoralbayAdapter:
+    return CoralbayAdapter()
+
+
+@pytest.fixture
+def lindhoff() -> LindhoffAdapter:
+    return LindhoffAdapter()
 
 
 def wait_until_blocked(engine, timeout: float = 10.0) -> None:
     """Block until another connection is waiting on a row lock.
 
-    Polling the server is what makes the race test deterministic. A sleep would
+    Polling the server is what makes a race test deterministic. A sleep would
     make it flaky on a loaded machine, which is the same thing as not testing
     the race at all.
     """
@@ -115,16 +123,6 @@ def wait_until_blocked(engine, timeout: float = 10.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError("no connection ever blocked on a lock")
-
-
-@pytest.fixture
-def coralbay() -> CoralbayAdapter:
-    return CoralbayAdapter()
-
-
-@pytest.fixture
-def lindhoff() -> LindhoffAdapter:
-    return LindhoffAdapter()
 
 
 # --------------------------------------------------------------------------- #
@@ -199,3 +197,4 @@ def utc(text_value: str) -> datetime:
 
 
 DAY = timedelta(days=1)
+PERIOD = "2026-08"

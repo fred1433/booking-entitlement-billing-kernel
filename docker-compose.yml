@@ -22,7 +22,6 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/kernel_dev
-      CLAIM_TOKEN_SECRET: development-only-replace-outside-compose
     ports:
       - "8000:8000"
     command: >

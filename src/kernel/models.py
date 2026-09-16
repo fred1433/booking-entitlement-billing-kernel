@@ -1,16 +1,23 @@
 """The schema.
 
-Five guarantees in this kernel are enforced by the database, not by the service
-layer, because the service layer is the part a future change can walk around:
+Several of the promises in this sample are kept by the database rather than by
+the service layer, because the service layer is the part a future change can
+walk around by accident:
 
-1. one booking per (partner, external_id)                  unique index
-2. one application per partner event id                    unique index
-3. at most three shares per entitlement                    unique index plus check
-4. one billing line per (entitlement, period)              unique index
-5. one charge per idempotency key                          unique index
+1. one booking per (partner, external_id)          unique index
+2. one application per partner event id            unique index
+3. one billing line per (entitlement, period)      unique index
+4. one durable intent per idempotency key          unique index
+5. one simulated external charge per key           unique index
 
 ``tests/test_database_guarantees.py`` proves each one by trying to break it in
 raw SQL, with the service layer out of the way.
+
+Both identity keys below are **assumptions, not facts**: that
+``(partner, external_id)`` names one booking for its whole life, and that
+``(entitlement, period)`` is the billable unit. They are written down in
+``docs/what-needs-confirmation.md`` as questions, because neither can be
+established from our side.
 """
 
 from __future__ import annotations
@@ -34,8 +41,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from .config import MAX_SHARES_PER_ENTITLEMENT
-
 
 class Base(DeclarativeBase):
     pass
@@ -47,9 +52,9 @@ class Base(DeclarativeBase):
 
 class DeliveryOutcome(str, Enum):
     APPLIED = "applied"
-    DUPLICATE = "duplicate"          # same event, delivered again
+    DUPLICATE = "duplicate"          # same event id, delivered again
     SUPERSEDED = "superseded"        # provably older than what we hold
-    CONFLICT = "conflict"            # same timestamp, different content
+    CONFLICT = "conflict"            # same identity, same version, different content
     ORDER_NOT_PROVABLE = "order_not_provable"
     QUARANTINED = "quarantined"      # unusable as received
     HELD = "held"                    # part of a batch that was not applied
@@ -62,20 +67,31 @@ class BookingStatus(str, Enum):
 
 
 class EntitlementState(str, Enum):
-    CREATED = "created"
-    CLAIMABLE = "claimable"
-    CLAIMED = "claimed"
+    """Deliberately two states.
+
+    A real product has a lifecycle. This sample is not the product: it exists
+    to exercise failure paths, and a larger lifecycle would add states without
+    adding a failure path.
+    """
+
     ACTIVE = "active"
     CANCELLED = "cancelled"
-    EXPIRED = "expired"
 
 
 class LineState(str, Enum):
-    PREPARED = "prepared"
-    CHARGED = "charged"
-    VOIDED = "voided"
-    REFUND_DUE = "refund_due"
-    BLOCKED = "blocked"              # source data is quarantined, do not bill
+    PREPARED = "prepared"            # intent recorded, nothing submitted
+    SUBMITTED = "submitted"          # sent to the external system, outcome unknown
+    CHARGED = "charged"              # external result established
+    VOIDED = "voided"                # cancelled before anything was submitted
+    BLOCKED = "blocked"              # source data is undecidable, do not prepare
+    UNRESOLVED = "unresolved"        # outcome unknown and no longer safely retryable
+
+
+class Cancellation(str, Enum):
+    NONE = "none"
+    BEFORE_SUBMISSION = "before_submission"
+    WHILE_UNRESOLVED = "while_unresolved"
+    AFTER_CHARGE = "after_charge"
 
 
 class BatchState(str, Enum):
@@ -89,7 +105,7 @@ class BatchState(str, Enum):
 # --------------------------------------------------------------------------- #
 
 class Delivery(Base):
-    """Every message the kernel received, with what it did about it.
+    """Every message received, with what was done about it.
 
     Append only. A duplicate is written here too: the journal answers "did you
     get my message" before it answers "did you act on it", and those are
@@ -100,7 +116,7 @@ class Delivery(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     partner: Mapped[str] = mapped_column(String(64), index=True)
-    channel: Mapped[str] = mapped_column(String(16))          # push, pull, file
+    channel: Mapped[str] = mapped_column(String(16))          # push, file
     source_event_id: Mapped[str | None] = mapped_column(String(128))
     external_id: Mapped[str | None] = mapped_column(String(128), index=True)
     payload: Mapped[dict] = mapped_column(JSONB)
@@ -138,7 +154,7 @@ class ProcessedEvent(Base):
 
 
 class Booking(Base):
-    """The kernel's own record of a booking, in the kernel's own vocabulary."""
+    """One booking, in this sample's own vocabulary."""
 
     __tablename__ = "bookings"
     __table_args__ = (
@@ -154,7 +170,8 @@ class Booking(Base):
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    unit_amount_cents: Mapped[int] = mapped_column(Integer)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    amount_basis: Mapped[str] = mapped_column(String(16), default="per_unit")
     currency: Mapped[str] = mapped_column(String(3))
 
     updated_at_raw: Mapped[str] = mapped_column(String(64))
@@ -163,6 +180,11 @@ class Booking(Base):
     updated_at_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
     payload_fingerprint: Mapped[str] = mapped_column(String(64))
 
+    #: Set when a delivery could not be decided. While it is set, nothing about
+    #: this booking is prepared for billing. Cleared when the question is
+    #: answered and the delivery replayed.
+    undecided_reason: Mapped[str | None] = mapped_column(Text)
+
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_delivery_id: Mapped[int | None] = mapped_column(BigInteger)
@@ -170,12 +192,34 @@ class Booking(Base):
     entitlement: Mapped["Entitlement"] = relationship(back_populates="booking", uselist=False)
 
 
-class QuarantineItem(Base):
-    """What we are waiting on, from whom, and since when.
+class VersionConflict(Base):
+    """Same identity, same version, different content.
 
-    This table is the blocked list an integration engineer takes into the
-    partner call. Nothing is ever silently dropped: it is quarantined, and the
-    reason is written in the partner's own terms.
+    Kept rather than resolved. Nothing here picks a winner, because nothing
+    here can: two payloads carrying the same ``updated_at`` and different
+    statuses do not say which one the partner sent last.
+    """
+
+    __tablename__ = "version_conflicts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), index=True)
+    delivery_id: Mapped[int] = mapped_column(BigInteger)
+    held_fingerprint: Mapped[str] = mapped_column(String(64))
+    incoming_fingerprint: Mapped[str] = mapped_column(String(64))
+    held_payload: Mapped[dict] = mapped_column(JSONB)
+    incoming_payload: Mapped[dict] = mapped_column(JSONB)
+    question_for_partner: Mapped[str] = mapped_column(Text)
+    raised_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class QuarantineItem(Base):
+    """What is being waited on, from whom, and since when.
+
+    Nothing is silently dropped: it is quarantined, and the reason is written
+    in the partner's own terms. ``needed_from_partner`` is the sentence an
+    engineer would actually send.
     """
 
     __tablename__ = "quarantine_items"
@@ -209,79 +253,25 @@ class ImportBatch(Base):
 
 
 # --------------------------------------------------------------------------- #
-# Entitlements
+# The billable obligation
 # --------------------------------------------------------------------------- #
 
 class Entitlement(Base):
     __tablename__ = "entitlements"
     __table_args__ = (
-        CheckConstraint(
-            "state in ('created','claimable','claimed','active','cancelled','expired')",
-            name="ck_entitlement_state",
-        ),
+        CheckConstraint("state in ('active','cancelled')", name="ck_entitlement_state"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), unique=True)
     state: Mapped[str] = mapped_column(String(32), index=True)
-    holder_ref: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    claimable_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancel_reason: Mapped[str | None] = mapped_column(Text)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     billable_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     billable_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     booking: Mapped[Booking] = relationship(back_populates="entitlement")
-    shares: Mapped[list["EntitlementShare"]] = relationship(back_populates="entitlement")
-
-
-class EntitlementShare(Base):
-    """Bounded sharing.
-
-    The bound is a unique index on the share slot plus a check on the slot
-    number, so the fourth share cannot be created even by two requests racing
-    each other. Counting rows in Python and comparing to a limit loses that
-    race roughly as often as the product is popular.
-    """
-
-    __tablename__ = "entitlement_shares"
-    __table_args__ = (
-        UniqueConstraint("entitlement_id", "share_index", name="uq_share_slot"),
-        CheckConstraint(
-            f"share_index >= 1 and share_index <= {MAX_SHARES_PER_ENTITLEMENT}",
-            name="ck_share_index_within_limit",
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    entitlement_id: Mapped[int] = mapped_column(ForeignKey("entitlements.id"))
-    share_index: Mapped[int] = mapped_column(Integer)
-    shared_with: Mapped[str] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    entitlement: Mapped[Entitlement] = relationship(back_populates="shares")
-
-
-class ClaimToken(Base):
-    """A passwordless claim link, stored as a hash.
-
-    The kernel keeps the hash, never the token. A dump of this table is not a
-    set of working claim links.
-    """
-
-    __tablename__ = "claim_tokens"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    entitlement_id: Mapped[int] = mapped_column(ForeignKey("entitlements.id"), index=True)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    consumed_by: Mapped[str | None] = mapped_column(String(128))
 
 
 # --------------------------------------------------------------------------- #
@@ -300,11 +290,17 @@ class BillingRun(Base):
 
 
 class BillingLine(Base):
-    """One line per entitlement per period. The database says so.
+    """One line per entitlement per period, and the durable intent for it.
 
-    ``idempotency_key`` is derived, not random: the same entitlement and the
-    same period always produce the same key, so a retry after a lost response
-    reaches the payment provider as the same request rather than a second one.
+    The line *is* the intent. It is written, with its key and the exact
+    parameters of the request, and committed, **before** anything is sent
+    anywhere. That ordering is the whole point: a process that dies between the
+    intent and the answer leaves a row that says what was attempted, which is
+    the only thing that makes a safe resume possible.
+
+    ``idempotency_key`` is derived from (entitlement, period), never generated
+    per attempt. ``request_fingerprint`` freezes the parameters, because a key
+    that stays put while the amount moves protects nothing.
     """
 
     __tablename__ = "billing_lines"
@@ -320,12 +316,52 @@ class BillingLine(Base):
     period: Mapped[str] = mapped_column(String(7))
     amount_cents: Mapped[int] = mapped_column(Integer)
     currency: Mapped[str] = mapped_column(String(3))
+
     idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
+
     state: Mapped[str] = mapped_column(String(16))
     reason: Mapped[str | None] = mapped_column(Text)
+    cancellation: Mapped[str] = mapped_column(String(24), default=Cancellation.NONE.value)
     charge_ref: Mapped[str | None] = mapped_column(String(128))
+
     prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    charged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+# --------------------------------------------------------------------------- #
+# The simulated external system
+# --------------------------------------------------------------------------- #
+
+class SimulatedProviderCharge(Base):
+    """The stand-in payment provider's own store.
+
+    It lives in PostgreSQL, in its own table, for one reason: a fake that keeps
+    its state in the worker's memory cannot show what happens when the worker
+    restarts, which is the only interesting moment in this whole repository.
+
+    This is a simulation. It is not Stripe, it makes no network call, and
+    nothing here has ever held a payment key. It reproduces three documented
+    behaviours of an idempotent create: the same key with the same parameters
+    replays the first result, the same key with different parameters is an
+    error, and a key is only remembered for a retention window, after which
+    presenting it again would create a new request rather than replay the old
+    one.
+    """
+
+    __tablename__ = "simulated_provider_charges"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_simulated_charge_key"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_fingerprint: Mapped[str] = mapped_column(String(64))
+    charge_ref: Mapped[str] = mapped_column(String(128))
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 # --------------------------------------------------------------------------- #
@@ -333,7 +369,7 @@ class BillingLine(Base):
 # --------------------------------------------------------------------------- #
 
 class JournalEntry(Base):
-    """What the kernel did, and above all what it refused to do.
+    """What was done, and above all what was refused.
 
     A refusal that is not written down is indistinguishable from a bug, both to
     the partner on the phone and to the engineer reading the incident a month

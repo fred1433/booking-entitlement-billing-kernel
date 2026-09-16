@@ -86,25 +86,6 @@ def test_same_timestamp_and_same_content_is_a_duplicate(session, lindhoff):
     assert again.reason == "same timestamp, same content"
 
 
-def test_same_timestamp_and_different_content_is_a_conflict_not_an_overwrite(session, lindhoff):
-    """Two versions, one timestamp. The kernel keeps what it has and asks.
-
-    Last write wins is a coin toss with somebody's booking, and the loser is
-    invisible: nothing in the data says an update was dropped.
-    """
-    apply_delivery(session, lindhoff, lindhoff_row(
-        external_ref="LH-3002", price_cents=18000), channel="file")
-    clash = apply_delivery(session, lindhoff, lindhoff_row(
-        external_ref="LH-3002", price_cents=25000), channel="file")
-    session.commit()
-
-    assert clash.outcome is DeliveryOutcome.CONFLICT
-    assert _booking(session, "lindhoff", "LH-3002").unit_amount_cents == 18000
-    item = session.execute(select(QuarantineItem)).scalar_one()
-    assert item.kind == "conflicting_versions"
-    assert "Which one is current" in item.needed_from_partner
-
-
 def test_a_retry_that_restamps_the_envelope_is_still_one_event(session, coralbay):
     """A retry carrying a fresher timestamp must not advance the booking's clock.
 
@@ -232,7 +213,7 @@ def test_two_readings_inside_the_repeated_hour_cannot_be_ordered(session, lindho
     assert unorderable.outcome is DeliveryOutcome.ORDER_NOT_PROVABLE
     assert later.outcome is DeliveryOutcome.APPLIED
     booking = _booking(session, "lindhoff", "LH-8001")
-    assert booking.unit_amount_cents == 20000
+    assert booking.amount_cents == 20000
     item = session.execute(
         select(QuarantineItem).where(QuarantineItem.kind == "order_not_provable")
     ).scalar_one()

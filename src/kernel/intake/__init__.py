@@ -5,6 +5,7 @@ from .service import (
     apply_delivery,
     expected_minimum_rows,
     import_file,
+    resolve_and_replay,
     run_pull_window,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "apply_delivery",
     "expected_minimum_rows",
     "import_file",
+    "resolve_and_replay",
     "run_pull_window",
 ]

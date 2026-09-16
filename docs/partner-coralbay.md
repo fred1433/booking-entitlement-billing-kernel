@@ -75,3 +75,16 @@ to resend.
 The kernel keeps this list itself, in `quarantine_items`, with the date each
 question was raised and the sentence to send. The monthly reconciliation prints
 it. Nothing is ever dropped quietly, so nobody has to remember.
+
+## The assumption in the money field
+
+`amount_minor` was described to us as **the price of one unit**, so a booking
+for two pax is worth twice it. That is a declaration, not something the payload
+says.
+
+**The question that would change the behaviour:** is `amount_minor` the price
+per pax, or the total for the booking? The two readings differ by the quantity
+on every invoice, and both parse.
+
+Read the other feed's note next to this one: it carries the same kind of
+integer and was told the opposite thing.

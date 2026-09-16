@@ -1,92 +1,146 @@
-"""The monthly run.
+"""Preparation, submission, and what a resume is allowed to do.
 
-The run has one job and one promise. The job: produce exactly one line per
-entitlement per period. The promise: never take money twice for the same line,
-whatever happens in the middle.
+The order of operations is the whole subject:
 
-Three things stand between the promise and reality, and only one of them is
-code the kernel controls:
+1. **prepare** writes one line per (entitlement, period). It is an insert that
+   does nothing on conflict, so two workers preparing the same period at the
+   same moment produce one line, not two.
+2. **submit** claims a prepared line with a conditional update, commits that
+   claim, and only then calls the external system. The committed claim is the
+   durable intent: it carries the derived key and the frozen parameters, and it
+   is what makes a safe resume possible at all.
+3. **resume** looks at intents whose outcome is unknown. Inside the retention
+   window it presents the same key with the same parameters, which replays
+   rather than repeats. Outside it, it refuses, because presenting a forgotten
+   key would create a new request. Those lines are marked unresolved and wait
+   for an outcome established another way.
 
-* a unique index on (entitlement, period), so a second line cannot exist even
-  if the run is started twice by two schedulers;
-* a derived idempotency key, so a charge replayed after a lost response reaches
-  the provider as the same request rather than a new one;
-* a commit per line, so a crash loses at most the record of one charge, and the
-  key above makes recovering that one charge free.
-
-The run is therefore safe to start again at any moment, including while it is
-already running, which is the only property that makes a billing job something
-you can operate at three in the morning.
+What this establishes is bounded, and worth stating plainly: within this model,
+with this simulated external system, a lost response does not become a second
+operation. It does not validate an integration with a real provider, which this
+sample does not exercise.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Callable
+import uuid
+from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from .. import journal
+from .. import journal, mutations
 from ..clock import month_bounds, utc_now
-from ..entitlements.state import BILLABLE
 from ..models import (
-    Booking,
     BillingLine,
     BillingRun,
+    Booking,
+    Cancellation,
     Entitlement,
+    EntitlementState,
     LineState,
     QuarantineItem,
 )
-from .payments import IdempotencyConflict, PaymentProvider, ProviderUnavailable
+from .payments import (
+    KEY_RETENTION,
+    IdempotencyConflict,
+    KeyNoLongerRetained,
+    PaymentProvider,
+    ProviderUnavailable,
+    request_fingerprint,
+)
 
 
-@dataclass
-class BillingRunResult:
-    run_id: int
-    period: str
-    prepared: int = 0
-    already_prepared: int = 0
-    blocked: int = 0
-    charged: int = 0
-    replayed: int = 0
-    failed: int = 0
-    lines: list[int] = field(default_factory=list)
+def billable_amount(booking: Booking) -> int:
+    """What this booking is worth for a period, according to a declaration.
+
+    The multiplication is not arithmetic, it is an interpretation of a sentence
+    somebody said about a field. One feed here means the price of a unit and the
+    other means the total for the row, so the identical number 18000 with
+    quantity 3 is either 540.00 or 180.00, and both readings parse.
+
+    This is where normalisation has to stop. The shape can be made uniform; the
+    meaning cannot be recovered from the payload, and getting it wrong is
+    invisible until an invoice is disputed.
+    """
+    if booking.amount_basis == "per_booking":
+        return booking.amount_cents
+    return booking.amount_cents * booking.quantity
 
 
-def idempotency_key(entitlement_id: int, period: str) -> str:
-    """Derived, never random. The same line always presents the same key."""
+def idempotency_key_for(entitlement_id: int, period: str) -> str:
+    """Derived from the line, never generated per attempt.
+
+    The one exception is a deliberate mutation used by the suite to show what
+    a per-attempt key costs.
+    """
+    if mutations.is_disabled(mutations.DERIVED_IDEMPOTENCY_KEY):
+        return f"bill:{entitlement_id}:{period}:{uuid.uuid4().hex[:8]}"
     return f"bill:{entitlement_id}:{period}"
 
 
-def prepare(session: Session, period: str, run: BillingRun | None = None) -> BillingRunResult:
-    """Write the lines for a period. Safe to call as often as you like."""
-    run = run or _open_run(session, period)
-    result = BillingRunResult(run_id=run.id, period=period)
-    period_start, period_end = month_bounds(period)
+# --------------------------------------------------------------------------- #
+# 1. Preparation
+# --------------------------------------------------------------------------- #
 
-    candidates = session.execute(
+def _is_undecidable(session: Session, booking: Booking) -> str | None:
+    """Whether anything about this booking is still an open question.
+
+    A booking whose latest delivery could not be decided, or which has an open
+    quarantine item, is not billed. This is a conservative demonstration
+    policy, not a rule anybody has agreed to: a real product might well choose
+    to bill the last confirmed state and correct later. The point is that the
+    choice is explicit and visible, rather than an accident of ordering.
+    """
+    if mutations.is_disabled(mutations.UNDECIDED_BLOCKS_BILLING):
+        return None
+    if booking.undecided_reason:
+        return booking.undecided_reason
+    open_item = session.scalar(
+        select(QuarantineItem).where(
+            QuarantineItem.partner == booking.partner,
+            QuarantineItem.external_id == booking.external_id,
+            QuarantineItem.resolved_at.is_(None),
+        )
+    )
+    return open_item.kind if open_item is not None else None
+
+
+def prepare(session: Session, period: str, now: datetime | None = None) -> BillingRun:
+    """Write one line per billable entitlement for the period.
+
+    Running it twice produces the same lines. Running it twice at the same
+    moment on two workers also produces the same lines, because the second
+    insert conflicts with the first on (entitlement, period) and does nothing.
+    """
+    now = now or utc_now()
+    start, end = month_bounds(period)
+
+    run = BillingRun(period=period, state="running", attempt=1)
+    session.add(run)
+    session.flush()
+
+    rows = session.execute(
         select(Entitlement, Booking)
         .join(Booking, Booking.id == Entitlement.booking_id)
-        .where(
-            Entitlement.state.in_(tuple(BILLABLE)),
-            Entitlement.billable_from < period_end,
-            Entitlement.billable_to >= period_start,
-        )
-        .order_by(Entitlement.id)
+        .where(Entitlement.billable_from < end)
+        .where((Entitlement.billable_to.is_(None)) | (Entitlement.billable_to > start))
     ).all()
 
-    for entitlement, booking in candidates:
-        blocked_by = _open_quarantine(session, booking)
-        amount = booking.unit_amount_cents * booking.quantity
-        state = LineState.BLOCKED.value if blocked_by else LineState.PREPARED.value
-        reason = (
-            f"source data is in quarantine: {blocked_by.kind}" if blocked_by else None
-        )
+    for entitlement, booking in rows:
+        blocked_reason = _is_undecidable(session, booking)
+        amount = billable_amount(booking)
+        key = idempotency_key_for(entitlement.id, period)
 
-        line_id = session.execute(
+        if blocked_reason:
+            state, reason = LineState.BLOCKED.value, blocked_reason
+        elif entitlement.state == EntitlementState.CANCELLED.value:
+            state, reason = LineState.VOIDED.value, "cancelled before the period was prepared"
+        else:
+            state, reason = LineState.PREPARED.value, None
+
+        statement = (
             pg_insert(BillingLine)
             .values(
                 run_id=run.id,
@@ -94,183 +148,297 @@ def prepare(session: Session, period: str, run: BillingRun | None = None) -> Bil
                 period=period,
                 amount_cents=amount,
                 currency=booking.currency,
-                idempotency_key=idempotency_key(entitlement.id, period),
+                idempotency_key=key,
+                request_fingerprint=request_fingerprint(amount, booking.currency),
                 state=state,
                 reason=reason,
+                cancellation=Cancellation.NONE.value,
+                prepared_at=now,
             )
             .on_conflict_do_nothing(constraint="uq_line_per_entitlement_period")
             .returning(BillingLine.id)
-        ).scalar_one_or_none()
+        )
+        created = session.execute(statement).scalar_one_or_none()
 
-        if line_id is None:
-            result.already_prepared += 1
-            continue
-
-        result.lines.append(line_id)
-        if blocked_by:
-            result.blocked += 1
+        if created is None:
+            journal.accepted(
+                session, "billing.prepare", f"entitlement/{entitlement.id}",
+                "a line for this entitlement and period already exists",
+            )
+        elif blocked_reason:
             journal.refused(
                 session, "billing.prepare", f"entitlement/{entitlement.id}",
-                reason, {"period": period, "line": line_id},
+                f"not prepared while a question is open: {blocked_reason}",
             )
         else:
-            result.prepared += 1
+            journal.accepted(session, "billing.prepare", f"entitlement/{entitlement.id}")
 
-    session.flush()
-    journal.accepted(
-        session, "billing.prepare", f"period/{period}", None,
-        {"prepared": result.prepared, "already_prepared": result.already_prepared,
-         "blocked": result.blocked},
-    )
-    session.commit()
-    return result
-
-
-def charge_prepared(
-    session: Session,
-    period: str,
-    provider: PaymentProvider,
-    result: BillingRunResult | None = None,
-    after_each: Callable[[int], None] | None = None,
-) -> BillingRunResult:
-    """Charge every prepared line of a period, one commit at a time.
-
-    ``after_each`` runs after a line is charged and committed. The tests use it
-    to stop the run at an awkward moment, which is the only moment worth
-    testing.
-    """
-    result = result or BillingRunResult(run_id=0, period=period)
-    lines = session.execute(
-        select(BillingLine)
-        .where(BillingLine.period == period, BillingLine.state == LineState.PREPARED.value)
-        .order_by(BillingLine.id)
-    ).scalars().all()
-
-    for line in lines:
-        try:
-            charge = provider.create_charge(
-                idempotency_key=line.idempotency_key,
-                amount_cents=line.amount_cents,
-                currency=line.currency,
-                metadata={"entitlement": str(line.entitlement_id), "period": period},
-            )
-        except ProviderUnavailable as error:
-            # The money may or may not have moved. The line stays prepared, and
-            # the next run presents the same key: the provider replays its own
-            # answer instead of charging again.
-            result.failed += 1
-            journal.refused(
-                session, "billing.charge", f"line/{line.id}",
-                f"provider did not answer: {error}",
-                {"idempotency_key": line.idempotency_key, "recovery": "same key on the next run"},
-            )
-            session.commit()
-            continue
-        except IdempotencyConflict as error:
-            result.failed += 1
-            line.state = LineState.BLOCKED.value
-            line.reason = str(error)
-            journal.refused(
-                session, "billing.charge", f"line/{line.id}",
-                f"idempotency key reused for a different request: {error}",
-                {"idempotency_key": line.idempotency_key},
-            )
-            session.commit()
-            continue
-
-        line.state = LineState.CHARGED.value
-        line.charge_ref = charge.id
-        line.charged_at = utc_now()
-        if charge.replayed:
-            result.replayed += 1
-            journal.accepted(
-                session, "billing.charge", f"line/{line.id}",
-                "provider replayed the charge it had already taken for this key",
-                {"charge": charge.id, "idempotency_key": line.idempotency_key},
-            )
-        else:
-            result.charged += 1
-            journal.accepted(session, "billing.charge", f"line/{line.id}", None,
-                             {"charge": charge.id, "amount_cents": line.amount_cents})
-        session.commit()
-        if after_each is not None:
-            after_each(line.id)
-
-    return result
-
-
-def run_billing(
-    session: Session,
-    period: str,
-    provider: PaymentProvider,
-    after_each: Callable[[int], None] | None = None,
-) -> BillingRunResult:
-    run = _open_run(session, period)
-    result = prepare(session, period, run)
-    charge_prepared(session, period, provider, result, after_each=after_each)
-    run.finished_at = utc_now()
-    run.state = "completed"
-    session.commit()
-    return result
-
-
-def on_entitlement_cancelled(session: Session, entitlement: Entitlement) -> None:
-    """A cancellation never rewrites history, it states what is owed.
-
-    A line that was prepared and not yet charged is voided. A line that was
-    already charged becomes a refund that somebody has to decide about, and it
-    stays on the reconciliation until they do. Deleting it would make the next
-    run bill the period again.
-    """
-    lines = session.execute(
-        select(BillingLine).where(BillingLine.entitlement_id == entitlement.id)
-    ).scalars().all()
-
-    for line in lines:
-        if line.state == LineState.PREPARED.value or line.state == LineState.BLOCKED.value:
-            line.state = LineState.VOIDED.value
-            line.reason = "entitlement cancelled before the charge was taken"
-            journal.accepted(session, "billing.void", f"line/{line.id}", line.reason,
-                             {"period": line.period})
-        elif line.state == LineState.CHARGED.value:
-            line.state = LineState.REFUND_DUE.value
-            line.reason = "entitlement cancelled after the charge was taken"
-            journal.refused(
-                session, "billing.cancel", f"line/{line.id}",
-                "cancelled after the charge, a refund is owed and is not automatic",
-                {"period": line.period, "charge": line.charge_ref,
-                 "amount_cents": line.amount_cents},
-            )
-    session.flush()
-
-
-def unblock_line(session: Session, line_id: int, note: str) -> BillingLine:
-    """Release a line once the partner has answered the question that blocked it."""
-    line = session.get(BillingLine, line_id)
-    if line.state != LineState.BLOCKED.value:
-        raise RuntimeError(f"line {line_id} is {line.state}, not blocked")
-    line.state = LineState.PREPARED.value
-    line.reason = f"unblocked: {note}"
-    journal.accepted(session, "billing.unblock", f"line/{line.id}", note, {"period": line.period})
-    session.flush()
-    return line
-
-
-def _open_run(session: Session, period: str) -> BillingRun:
-    attempt = session.execute(
-        select(BillingRun).where(BillingRun.period == period)
-    ).scalars().all()
-    run = BillingRun(period=period, state="running", attempt=len(attempt) + 1)
-    session.add(run)
+    run.finished_at = now
+    run.state = "prepared"
     session.flush()
     return run
 
 
-def _open_quarantine(session: Session, booking: Booking) -> QuarantineItem | None:
-    return session.execute(
-        select(QuarantineItem).where(
-            QuarantineItem.partner == booking.partner,
-            QuarantineItem.external_id == booking.external_id,
-            QuarantineItem.resolved_at.is_(None),
-        ).limit(1)
+# --------------------------------------------------------------------------- #
+# 2. Submission
+# --------------------------------------------------------------------------- #
+
+def _claim(session: Session, line_id: int, now: datetime) -> bool:
+    """Take a prepared line, atomically.
+
+    One statement moves the line out of ``prepared``, so a second worker
+    reading the same line a microsecond later finds nothing to take. A read
+    followed by a write would let both of them through.
+    """
+    claimed = session.execute(
+        text(
+            "update billing_lines set state = :submitted, submitted_at = :now "
+            "where id = :id and state = :prepared returning id"
+        ),
+        {
+            "submitted": LineState.SUBMITTED.value,
+            "prepared": LineState.PREPARED.value,
+            "now": now,
+            "id": line_id,
+        },
     ).scalar_one_or_none()
+    return claimed is not None
+
+
+def submit(
+    session_factory: sessionmaker[Session],
+    provider: PaymentProvider,
+    period: str,
+    now: datetime | None = None,
+) -> dict[str, int]:
+    """Submit every prepared line for the period, one committed step at a time.
+
+    Each line gets its own transaction, because a worker that dies halfway
+    through a period must leave the lines it finished finished, and the line it
+    was on marked as attempted.
+    """
+    now = now or utc_now()
+    summary = {"submitted": 0, "charged": 0, "lost": 0, "refused": 0}
+
+    with session_factory() as reader:
+        line_ids = list(
+            reader.scalars(
+                select(BillingLine.id)
+                .where(BillingLine.period == period)
+                .where(BillingLine.state == LineState.PREPARED.value)
+                .order_by(BillingLine.id)
+            )
+        )
+
+    for line_id in line_ids:
+        with session_factory() as session:
+            if not _claim(session, line_id, now):
+                session.commit()
+                continue
+            line = session.get(BillingLine, line_id)
+            key, fingerprint = line.idempotency_key, line.request_fingerprint
+            amount, currency = line.amount_cents, line.currency
+            if mutations.is_disabled(mutations.INTENT_BEFORE_CALL):
+                session.rollback()          # the evidence is thrown away
+            else:
+                session.commit()            # the intent is durable from here on
+            summary["submitted"] += 1
+
+        try:
+            result = provider.create_charge(key, fingerprint, amount, currency)
+        except ProviderUnavailable as lost:
+            summary["lost"] += 1
+            with session_factory() as session:
+                journal.refused(session, "billing.submit", f"line/{line_id}", str(lost))
+                session.commit()
+            continue
+        except IdempotencyConflict as clash:
+            summary["refused"] += 1
+            with session_factory() as session:
+                journal.refused(session, "billing.submit", f"line/{line_id}", str(clash))
+                session.commit()
+            continue
+
+        with session_factory() as session:
+            _settle(session, line_id, result.charge_ref, now)
+            journal.accepted(
+                session, "billing.submit", f"line/{line_id}",
+                "replayed by the provider" if result.replayed else None,
+            )
+            session.commit()
+        summary["charged"] += 1
+
+    return summary
+
+
+def _settle(session: Session, line_id: int, charge_ref: str, now: datetime) -> None:
+    line = session.get(BillingLine, line_id)
+    line.state = LineState.CHARGED.value
+    line.charge_ref = charge_ref
+    line.resolved_at = now
+
+
+# --------------------------------------------------------------------------- #
+# 3. Resume
+# --------------------------------------------------------------------------- #
+
+def resume(
+    session_factory: sessionmaker[Session],
+    provider: PaymentProvider,
+    period: str,
+    now: datetime | None = None,
+    retention: timedelta = KEY_RETENTION,
+) -> dict[str, int]:
+    """Deal with intents whose outcome nobody knows.
+
+    Inside the retention window the same key with the same parameters is
+    presented again: that replays the stored result rather than repeating the
+    operation, and the line is settled on the answer that comes back.
+
+    Outside the window the key has been forgotten by the other side. Sending it
+    again would create a new request, so nothing is sent. The line becomes
+    unresolved and stays on the report until the outcome is established another
+    way. This is the branch that usually does not exist, and it is the reason
+    the window is a parameter rather than a constant in a comment.
+    """
+    now = now or utc_now()
+    summary = {"replayed": 0, "unresolved": 0, "still_lost": 0}
+
+    with session_factory() as reader:
+        pending = list(
+            reader.execute(
+                select(BillingLine.id, BillingLine.submitted_at)
+                .where(BillingLine.period == period)
+                .where(BillingLine.state == LineState.SUBMITTED.value)
+                .order_by(BillingLine.id)
+            ).all()
+        )
+
+    for line_id, submitted_at in pending:
+        age = now - submitted_at if submitted_at else timedelta(0)
+        if age > retention:
+            with session_factory() as session:
+                line = session.get(BillingLine, line_id)
+                line.state = LineState.UNRESOLVED.value
+                line.reason = (
+                    "outcome unknown and the key is past the provider retention window, "
+                    "so it must not be presented again: establish the result out of band"
+                )
+                journal.refused(session, "billing.resume", f"line/{line_id}", line.reason)
+                session.commit()
+            summary["unresolved"] += 1
+            continue
+
+        with session_factory() as reader:
+            line = reader.get(BillingLine, line_id)
+            key, fingerprint = line.idempotency_key, line.request_fingerprint
+            amount, currency = line.amount_cents, line.currency
+
+        try:
+            result = provider.create_charge(key, fingerprint, amount, currency)
+        except (ProviderUnavailable, KeyNoLongerRetained) as still_unknown:
+            summary["still_lost"] += 1
+            with session_factory() as session:
+                journal.refused(session, "billing.resume", f"line/{line_id}", str(still_unknown))
+                session.commit()
+            continue
+
+        with session_factory() as session:
+            _settle(session, line_id, result.charge_ref, now)
+            journal.accepted(
+                session, "billing.resume", f"line/{line_id}",
+                "the provider replayed the operation it had already carried out"
+                if result.replayed else "carried out on this attempt",
+            )
+            session.commit()
+        summary["replayed"] += 1
+
+    return summary
+
+
+def establish_out_of_band(
+    session: Session,
+    provider: PaymentProvider,
+    line_id: int,
+    now: datetime | None = None,
+) -> str:
+    """Close an unresolved line by looking the outcome up rather than retrying.
+
+    This is the manual step a person performs against the provider's own
+    records. It is in the repository because the alternative, quietly retrying,
+    is the thing that turns one operation into two.
+    """
+    now = now or utc_now()
+    line = session.get(BillingLine, line_id)
+    found = provider.lookup(line.idempotency_key)
+    if found is None:
+        line.state = LineState.PREPARED.value
+        line.submitted_at = None
+        line.reason = "established out of band: the operation never happened, safe to prepare again"
+        journal.accepted(session, "billing.establish", f"line/{line_id}", line.reason)
+        return "never_happened"
+    line.state = LineState.CHARGED.value
+    line.charge_ref = found.charge_ref
+    line.resolved_at = now
+    line.reason = "established out of band: the operation had happened, no second attempt"
+    journal.accepted(session, "billing.establish", f"line/{line_id}", line.reason)
+    return "already_happened"
+
+
+# --------------------------------------------------------------------------- #
+# 4. Cancellation, in the three places it can land
+# --------------------------------------------------------------------------- #
+
+def cancel(session: Session, entitlement_id: int, reason: str, now: datetime | None = None) -> dict[str, str]:
+    """Record a cancellation against whatever state each line is in.
+
+    Three situations, and they are not the same situation:
+
+    * before anything was submitted, the line is voided and that is the end of it;
+    * while the outcome is unknown, nothing can be decided at all, because
+      deciding requires knowing whether money moved;
+    * after the operation is established, the line stays. What is owed to whom
+      is a commercial question, and no rule for it is invented here.
+
+    No line is ever deleted. Deleting is what makes the next run find nothing
+    for the period and do the whole thing again.
+    """
+    now = now or utc_now()
+    entitlement = session.get(Entitlement, entitlement_id)
+    entitlement.state = EntitlementState.CANCELLED.value
+    entitlement.cancelled_at = now
+    entitlement.cancel_reason = reason
+
+    outcomes: dict[str, str] = {}
+    lines = session.scalars(
+        select(BillingLine).where(BillingLine.entitlement_id == entitlement_id)
+    ).all()
+
+    for line in lines:
+        if line.state in (LineState.PREPARED.value, LineState.BLOCKED.value):
+            line.state = LineState.VOIDED.value
+            line.cancellation = Cancellation.BEFORE_SUBMISSION.value
+            line.reason = "cancelled before anything was submitted"
+            journal.accepted(session, "billing.cancel", f"line/{line.id}", line.reason)
+            outcomes[str(line.id)] = Cancellation.BEFORE_SUBMISSION.value
+
+        elif line.state in (LineState.SUBMITTED.value, LineState.UNRESOLVED.value):
+            line.cancellation = Cancellation.WHILE_UNRESOLVED.value
+            line.reason = (
+                "cancelled while the outcome was unknown: nothing can be decided "
+                "until it is established whether the operation happened"
+            )
+            journal.refused(session, "billing.cancel", f"line/{line.id}", line.reason)
+            outcomes[str(line.id)] = Cancellation.WHILE_UNRESOLVED.value
+
+        elif line.state == LineState.CHARGED.value:
+            line.cancellation = Cancellation.AFTER_CHARGE.value
+            line.reason = (
+                "cancelled after the operation was established: what is owed is a "
+                "commercial decision, and this sample does not make it"
+            )
+            journal.refused(session, "billing.cancel", f"line/{line.id}", line.reason)
+            outcomes[str(line.id)] = Cancellation.AFTER_CHARGE.value
+
+    session.flush()
+    return outcomes

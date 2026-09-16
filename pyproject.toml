@@ -1,7 +1,7 @@
 [project]
 name = "booking-entitlement-billing-kernel"
 version = "0.1.0"
-description = "A small core for the hard part of a booking integration: duplicate deliveries, out of order updates, partner data that disagrees with itself, and a billing run that never charges twice."
+description = "Failure cases from a booking-to-billing integration, each one a test: a lost answer after a successful external operation, concurrent workers, version collisions, and data nobody can decide."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
