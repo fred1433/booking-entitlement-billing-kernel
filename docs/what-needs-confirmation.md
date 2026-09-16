@@ -53,10 +53,11 @@ exists and expensive afterwards.
 | Naive timestamps are in the declared zone | ordering is wrong for one hour, twice a year, on two of the busiest nights for changes | treated as a one hour window, and refused when two windows overlap |
 | The nightly file is complete | a truncated file quietly cancels everything it failed to mention | structural checks plus a floor taken from this feed's own history |
 
-## 4. What the external system's documented behaviour actually says
+## 4. What Stripe's documented behaviour actually says
 
-The submission path is shaped by four published facts about idempotent creates,
-and each one removes a tempting shortcut:
+The simulated provider is written against the behaviour Stripe documents for
+idempotent creates, and the submission path is shaped by four of those published
+facts. Each one removes a tempting shortcut:
 
 1. **An idempotency key may be forgotten after 24 hours.** Presenting it after
    that does not replay anything, it creates a new request. So a retry is only
