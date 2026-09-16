@@ -169,6 +169,10 @@ Tests:
 TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/kernel_test pytest
 ```
 
+Any PostgreSQL from 14 up will do, with or without the compose file: point
+`TEST_DATABASE_URL` at an empty database and the suite migrates it itself. CI is
+the reference run, on PostgreSQL 16, on the schema the migration produced.
+
 ---
 
 ## Layout
